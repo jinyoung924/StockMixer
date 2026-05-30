@@ -2,6 +2,21 @@ import numpy as np
 import os
 from tqdm import tqdm
 
+# 원시 csv에서 .pkl을 만들때 사용하는 코드 - 지금은 있는 .pkl 데이터 사용한다.
+
+'''
+이 함수를 거쳐 만들어지는 배열 4개
+
+1. eod_data — 입력 피처. 형태는 (종목수 1026, 거래일수 1245, 피처수 5)
+    0 : 5일 이동평균 (정규화)
+    1 : 10일 이동평균 (정규화)
+    2 : 20일 이동평균 (정규화)
+    3 : 30일 이동평균 (정규화)
+    4 : 당일 정규화 종가 (close)
+2. gt_data — 정답. 각 종목·각 날짜의 실제 수익률(다음 날 종가 변화율)
+3. price_data — 기준가(예측 시점의 종가)
+4. mask_data — 유효 여부. 결측이면 0, 정상이면 1 : 직사각형 매트릭스에서 의미있는 값이면 1로 되어있다. 
+'''
 
 def load_EOD_data(data_path, market_name, tickers, steps=1):
     eod_data = []

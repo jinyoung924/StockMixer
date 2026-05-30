@@ -1,0 +1,17 @@
+StockMixer/
+├── src/
+│   ├── model.py            (원본, 그대로 둠)
+│   ├── evaluator.py        (원본)
+│   ├── load_data.py        (원본)
+│   ├── train.py            (원본)
+│   └── exp/                ← 새로 만드는 실험 폴더
+│       ├── final_layers.py     교체할 최종 레이어 + (variant, version) 레지스트리
+│       ├── model_exp.py        head 교체형 StockMixer 래퍼
+│       └── train_exp.py        실험용 학습 스크립트 (컨트롤러가 호출)
+└── experiments/            ← 결과가 쌓이는 곳 (자동 생성)
+    ├── comparison.csv          모든 실험 누적 비교표
+    └── {variant}_v{n}_{market}_{날짜}/
+        ├── config.json
+        ├── best_model.pt
+        ├── history.csv
+        └── best_summary.json
