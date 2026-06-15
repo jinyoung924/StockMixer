@@ -1,19 +1,21 @@
 """
-최종 레이어 교체 실험용 학습 스크립트.
+결합부(combine) 메커니즘 비교 실험용 학습 스크립트.
 
 원본 train.py 의 학습/평가 로직은 그대로 따르되, 다음을 추가한다:
-  1) --variant / --version 으로 최종 레이어를 선택 (original / film / market_gating)
+  1) --combine-mode 로 결합부를 선택 (add / gate / film / attn)
   2) 검증 손실 기준 best 모델 가중치를 .pt 로 저장
-  3) 에폭별 지표를 history.csv 로 저장
+  3) 에폭별 지표를 history.csv 로 저장 (train vs valid/test 격차 = 과적합 진단용)
   4) 실험 설정을 config.json 으로 저장
   5) 모든 실험을 comparison.csv 한 파일에 누적해 비교 가능
 
-사용 예 (코랩 셀에서):
-  !cd "{REPO_DIR}/src" && python train_exp.py --variant original     --version 1 --epochs 100
-  !cd "{REPO_DIR}/src" && python train_exp.py --variant film          --version 1 --epochs 100
-  !cd "{REPO_DIR}/src" && python train_exp.py --variant market_gating --version 1 --epochs 100
+(데이터셋 2종) × (결합 4종) = 8개 설정을 --market / --combine-mode 토글로 전환한다.
 
-결과는 기본적으로 ../experiments/ 아래에 쌓인다 (--exp-root 로 변경 가능).
+사용 예 (코랩 셀에서):
+  !cd "{REPO_DIR}/src/exp" && python train_exp.py --combine-mode add  --market NASDAQ --epochs 100
+  !cd "{REPO_DIR}/src/exp" && python train_exp.py --combine-mode gate --market SP500  --beta 5 --epochs 100
+  !cd "{REPO_DIR}/src/exp" && python train_exp.py --combine-mode attn --market NASDAQ --d-attn 16 --epochs 100
+
+결과는 기본적으로 ../../experiments/ 아래에 쌓인다 (--exp-root 로 변경 가능).
 """
 import os
 import sys
@@ -37,13 +39,14 @@ if _SRC_DIR not in sys.path:
 from evaluator import evaluate
 from model import get_loss
 from model_exp import StockMixerExp
-from final_layers import list_variants
+from final_layers import list_modes
 
 
-# 데이터셋별 분할 인덱스 (paper Table 1 기준)
+# 데이터셋별 분할 인덱스 + stock mixing 의 market_num (paper Table 1 기준)
+# market_num 은 NoGraphMixer 의 hidden dim (결합부 m_tau 차원과 무관, 혼동 주의)
 MARKET_CONFIG = {
-    "NASDAQ": dict(valid_index=756, test_index=1008),
-    "SP500":  dict(valid_index=1006, test_index=1259),
+    "NASDAQ": dict(valid_index=756, test_index=1008, market_num=20),
+    "SP500":  dict(valid_index=1006, test_index=1259, market_num=8),
 }
 
 
@@ -83,15 +86,18 @@ def load_dataset(data_path, market_name, steps):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--variant", default="original",
-                    help="original | film | market_gating")
-    ap.add_argument("--version", type=int, default=1)
+    ap.add_argument("--combine-mode", default="add",
+                    help="add | gate | film | attn")
     ap.add_argument("--market", default="NASDAQ", help="NASDAQ | SP500")
+    ap.add_argument("--beta", type=float, default=5.0,
+                    help="gate/film 게이팅 온도 (작을수록 강함)")
+    ap.add_argument("--d-attn", type=int, default=16, help="attn 모드 어텐션 차원")
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--lr", type=float, default=0.001)
     ap.add_argument("--alpha", type=float, default=0.1)
     ap.add_argument("--lookback", type=int, default=16)
-    ap.add_argument("--market-dim", type=int, default=20, help="stock mixing 의 m")
+    ap.add_argument("--market-dim", type=int, default=None,
+                    help="stock mixing 의 hidden m (미지정 시 데이터셋 기본값)")
     ap.add_argument("--scale", type=int, default=3)
     ap.add_argument("--steps", type=int, default=1)
     ap.add_argument("--data-path", default="../../dataset",
@@ -99,13 +105,11 @@ def main():
     ap.add_argument("--exp-root", default="../../experiments",
                     help="결과 저장 루트 (드라이브 경로로 바꿔도 됨)")
     ap.add_argument("--tag", default="", help="실험 메모(선택)")
-    ap.add_argument("--list", action="store_true", help="등록된 variant 목록만 출력")
+    ap.add_argument("--list", action="store_true", help="등록된 combine_mode 목록만 출력")
     args = ap.parse_args()
 
     if args.list:
-        print("등록된 (variant, version):")
-        for v in list_variants():
-            print("  ", v)
+        print("등록된 combine_mode:", ", ".join(list_modes()))
         return
 
     set_seed()
@@ -119,28 +123,32 @@ def main():
     trade_dates = mask_data.shape[1]
     mc = MARKET_CONFIG.get(args.market, MARKET_CONFIG["NASDAQ"])
     valid_index, test_index = mc["valid_index"], mc["test_index"]
+    market_dim = args.market_dim if args.market_dim is not None else mc["market_num"]
     lookback = args.lookback
     steps = args.steps
+    print(f"data: stocks={stock_num}, days={trade_dates}, F={eod_data.shape[-1]} "
+          f"(market_num={market_dim}, valid={valid_index}, test={test_index})")
 
     # ---- 모델 ----
     model = StockMixerExp(
         stocks=stock_num, time_steps=lookback, channels=fea_num,
-        market=args.market_dim, scale=args.scale,
-        variant=args.variant, version=args.version,
+        market=market_dim, scale=args.scale,
+        combine_mode=args.combine_mode, beta=args.beta, d_attn=args.d_attn,
     ).to(device)
     info = model.describe()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # ---- 실험 폴더 ----
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_id = f"{args.variant}_v{args.version}_{args.market}_{stamp}"
+    exp_id = f"{args.combine_mode}_{args.market}_{stamp}"
     exp_dir = os.path.join(args.exp_root, exp_id)
     os.makedirs(exp_dir, exist_ok=True)
 
     config = dict(
-        exp_id=exp_id, variant=args.variant, version=args.version,
+        exp_id=exp_id, combine_mode=args.combine_mode,
         market=args.market, epochs=args.epochs, lr=args.lr, alpha=args.alpha,
-        lookback=lookback, market_dim=args.market_dim, scale=args.scale,
+        beta=args.beta, d_attn=args.d_attn,
+        lookback=lookback, market_dim=market_dim, scale=args.scale,
         steps=steps, stock_num=stock_num, device=str(device),
         total_params=info["total_params"], head_params=info["head_params"],
         tag=args.tag, timestamp=stamp,
@@ -150,7 +158,7 @@ def main():
 
     print("=" * 60)
     print(f"  실험 시작: {exp_id}")
-    print(f"  variant={args.variant} v{args.version} | market={args.market} "
+    print(f"  combine_mode={args.combine_mode} | market={args.market} "
           f"| device={device}")
     print(f"  파라미터 총 {info['total_params']:,} (head {info['head_params']:,})")
     print("=" * 60)
@@ -179,7 +187,7 @@ def main():
             base = start_index - lookback - steps + 1
             for off in range(base, end_index - lookback - steps + 1):
                 db, mb, pb, gb = map(lambda x: torch.Tensor(x).to(device), get_batch(off))
-                prediction = model(db)
+                prediction = model(db, mb)   # mask 전달 → masked m_tau
                 cl, crl, crk, cur_rr = get_loss(prediction, gb, pb, mb, stock_num, args.alpha)
                 loss += cl.item(); reg_loss += crl.item(); rank_loss += crk.item()
                 idx = off - base
@@ -212,7 +220,7 @@ def main():
             db, mb, pb, gb = map(lambda x: torch.Tensor(x).to(device),
                                  get_batch(batch_offsets[j]))
             optimizer.zero_grad()
-            prediction = model(db)
+            prediction = model(db, mb)   # mask 전달 → masked m_tau
             cl, _, _, _ = get_loss(prediction, gb, pb, mb, stock_num, args.alpha)
             cl.backward()
             optimizer.step()
@@ -254,8 +262,9 @@ def main():
     # ---- best 결과 저장 + 비교표 누적 ----
     bt = best["test_perf"]; bv = best["val_perf"]
     summary = dict(
-        exp_id=exp_id, variant=args.variant, version=args.version,
-        market=args.market, epochs=args.epochs, best_epoch=best["epoch"],
+        exp_id=exp_id, combine_mode=args.combine_mode,
+        market=args.market, beta=args.beta, d_attn=args.d_attn,
+        epochs=args.epochs, best_epoch=best["epoch"],
         best_val_loss=round(best["val_loss"], 6),
         val_IC=round(bv["IC"], 4), val_RIC=round(bv["RIC"], 4),
         test_IC=round(bt["IC"], 4), test_RIC=round(bt["RIC"], 4),
