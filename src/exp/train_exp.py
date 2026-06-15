@@ -20,6 +20,7 @@
 import os
 import sys
 import csv
+import glob
 import json
 import time
 import random
@@ -139,10 +140,15 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # ---- 실험 폴더 ----
+    # exp_id = 레이어(combine_mode)_데이터(market)_타임스탬프 → 몇 번째 실험인지 식별
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     exp_id = f"{args.combine_mode}_{args.market}_{stamp}"
     exp_dir = os.path.join(args.exp_root, exp_id)
     os.makedirs(exp_dir, exist_ok=True)
+
+    # 결과 파일도 폴더와 같은 exp_id 를 접두사로 붙여 자기설명적으로 저장
+    # (파일만 따로 옮겨도 어떤 실험인지 식별 가능)
+    out = lambda name: os.path.join(exp_dir, f"{exp_id}_{name}")
 
     config = dict(
         exp_id=exp_id, combine_mode=args.combine_mode,
@@ -153,7 +159,7 @@ def main():
         total_params=info["total_params"], head_params=info["head_params"],
         tag=args.tag, timestamp=stamp,
     )
-    with open(os.path.join(exp_dir, "config.json"), "w") as f:
+    with open(out("config.json"), "w") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
     print("=" * 60)
@@ -199,7 +205,7 @@ def main():
         return loss, perf
 
     # ---- 히스토리 csv 준비 ----
-    hist_path = os.path.join(exp_dir, "history.csv")
+    hist_path = out("history.csv")
     hist_fields = ["epoch", "train_loss", "val_loss", "test_loss",
                    "val_IC", "val_RIC", "val_prec10", "val_SR",
                    "test_IC", "test_RIC", "test_prec10", "test_SR"]
@@ -249,7 +255,7 @@ def main():
                 "model_state": model.state_dict(),
                 "config": config,
                 "epoch": epoch + 1,
-            }, os.path.join(exp_dir, "best_model.pt"))
+            }, out("best_model.pt"))
 
         print(f"[{epoch+1:3d}/{args.epochs}] "
               f"train={tra_loss:.2e} val={val_loss:.2e} test={test_loss:.2e} | "
@@ -272,18 +278,33 @@ def main():
         total_params=info["total_params"], head_params=info["head_params"],
         minutes=round(elapsed / 60, 1), tag=args.tag, timestamp=stamp,
     )
-    with open(os.path.join(exp_dir, "best_summary.json"), "w") as f:
+    with open(out("best_summary.json"), "w") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    # comparison.csv 누적 (없으면 헤더 생성, 있으면 한 줄 추가)
+    # comparison.csv 재구성 (append 아님)
+    # 모든 실험 폴더의 best_summary.json 을 모아 exp_id 기준으로 정렬해 매번 다시 쓴다.
+    #   - 행마다 exp_id(레이어_데이터_타임스탬프)가 있어 어떤 실험인지 식별 가능
+    #   - 옛 행이 남지 않고 항상 최신 결과 집합만 반영 (바뀐 결과 확인 용이)
+    #   - 스키마가 달라져도(컬럼 추가) 키 합집합으로 흡수 → ParserError 방지
     os.makedirs(args.exp_root, exist_ok=True)
     cmp_path = os.path.join(args.exp_root, "comparison.csv")
-    write_header = not os.path.exists(cmp_path)
-    with open(cmp_path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(summary.keys()))
-        if write_header:
-            w.writeheader()
-        w.writerow(summary)
+    all_rows = []
+    for p in glob.glob(os.path.join(args.exp_root, "*", "*best_summary.json")):
+        try:
+            with open(p) as jf:
+                all_rows.append(json.load(jf))
+        except (OSError, json.JSONDecodeError):
+            pass
+    all_rows.sort(key=lambda r: r.get("exp_id", ""))
+    fieldnames = list(summary.keys())                 # 이번 실험 키를 기준 컬럼 순서로
+    for r in all_rows:                                 # 다른 스키마의 추가 키는 뒤에 덧붙임
+        for k in r:
+            if k not in fieldnames:
+                fieldnames.append(k)
+    with open(cmp_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, restval="")
+        w.writeheader()
+        w.writerows(all_rows)
 
     print("=" * 60)
     print(f"  완료: best epoch {best['epoch']} (val_loss={best['val_loss']:.2e})")
@@ -291,7 +312,7 @@ def main():
           f"prec@10={bt['prec_10']:.4f} SR={bt['sharpe5']:.4f}")
     print(f"  소요 {summary['minutes']} 분")
     print(f"  저장 위치: {exp_dir}")
-    print(f"  비교표 누적: {cmp_path}")
+    print(f"  비교표 재구성: {cmp_path} (총 {len(all_rows)}개 실험)")
     print("=" * 60)
 
 

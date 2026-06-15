@@ -4,7 +4,8 @@
       "Read(//Users/gimjin-yeong/Documents/ssu_2026-1/MASTER/**)",
       "Read(//Users/gimjin-yeong/Documents/ssu_2026-1/film/**)",
       "Bash(python3 -m py_compile final_layers.py model_exp.py train_exp.py)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -m py_compile train_exp.py)"
     ]
   }
 }
