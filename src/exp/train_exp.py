@@ -1,21 +1,32 @@
 """
-결합부(combine) 메커니즘 비교 실험용 학습 스크립트.
+시장레짐 정보 × 주입 구조 비교 실험 — CSI300 / StockMixer 하네스.
 
-원본 train.py 의 학습/평가 로직은 그대로 따르되, 다음을 추가한다:
-  1) --combine-mode 로 결합부를 선택 (add / gate / film / attn)
-  2) 검증 손실 기준 best 모델 가중치를 .pt 로 저장
-  3) 에폭별 지표를 history.csv 로 저장 (train vs valid/test 격차 = 과적합 진단용)
-  4) 실험 설정을 config.json 으로 저장
-  5) 모든 실험을 comparison.csv 한 파일에 누적해 비교 가능
+검증 목표(두 축을 분리):
+  Q1 정보의 가치  : 더 풍부한 정보(alpha158 13피처 + m_τ)가 예측력을 올리는가?
+  Q2 구조의 역할  : 같은 정보라도 주입 구조(add/concat/gating)가 결과를 바꾸는가?
 
-(데이터셋 2종) × (결합 4종) = 8개 설정을 --market / --combine-mode 토글로 전환한다.
+4개 arm (입력 피처 × 결합부만 다르고 mask/gt/price·백본·분할은 전부 고정):
+  baseline   : 종가 5피처     + AddHead        (CSI300 위의 원본 StockMixer, 절대 출발점)
+  add        : alpha158 13피처 + AddHead        (구조 비교 기준, m_τ 미반영)
+  concat     : alpha158 13피처 + Concat(m_τ)    (덧셈적 주입; _lin / _mlp 변형)
+  gating     : alpha158 13피처 + Gate(m_τ)      (곱셈적 주입, 주 모델)
 
-사용 예 (코랩 셀에서):
-  !cd "{REPO_DIR}/src/exp" && python train_exp.py --combine-mode add  --market NASDAQ --epochs 100
-  !cd "{REPO_DIR}/src/exp" && python train_exp.py --combine-mode gate --market SP500  --beta 5 --epochs 100
-  !cd "{REPO_DIR}/src/exp" && python train_exp.py --combine-mode attn --market NASDAQ --d-attn 16 --epochs 100
+비교 축:
+  C1(피처)  baseline ↔ add          : 결합부 동일, 입력 5→13
+  C2(정보)  add ↔ {concat, gating}  : 피처 13 동일, m_τ 주입 여부
+  C3(구조)  concat ↔ gating         : 피처·정보·백본 동일, 결합부만
+  D1(진단)  add ↔ concat_lin        : 선형 주입은 순위 불변 예상
 
-결과는 기본적으로 ../../experiments/ 아래에 쌓인다 (--exp-root 로 변경 가능).
+원본 train.py 의 학습/예측/평가 골격을 계승하되:
+  - 라벨은 StockMixer raw forward return, 손실은 원본 get_loss(base_price=price_data).
+  - 평가는 evaluator_exp(IC/ICIR/RankIC/RankICIR/prec@10/SR).
+  - 결과는 arm×seed 로 experiments/ 에 쌓고 comparison.csv 로 재구성.
+
+사용 예:
+  python train_exp.py --arm baseline   --seed 0 --epochs 100
+  python train_exp.py --arm add        --seed 0 --epochs 100
+  python train_exp.py --arm concat_mlp --seed 0 --epochs 100
+  python train_exp.py --arm gating     --seed 0 --beta 2 --epochs 100
 """
 import os
 import sys
@@ -28,134 +39,122 @@ import argparse
 import datetime
 import numpy as np
 import torch
-import pickle
 
-# 이 파일은 src/exp/ 안에 있으므로, 부모 src 폴더를 import 경로에 추가해
-# 원본 evaluator.py / model.py / load_data.py 를 그대로 쓸 수 있게 한다.
+# src/exp/ 에서 부모 src 의 원본 model.py(get_loss)를 import 하기 위한 경로 추가
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC_DIR = os.path.dirname(_THIS_DIR)
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from evaluator import evaluate
-from model import get_loss
+from model import get_loss                 # 원본 손실(MSE + α·pairwise rank), 그대로 계승
 from model_exp import StockMixerExp
-from final_layers import list_modes
+from evaluator_exp import evaluate
+from data_csi300 import load_csi300
+from final_layers import list_modes, M_DIM
 
 
-# 데이터셋별 분할 인덱스 + stock mixing 의 market_num (paper Table 1 기준)
-# market_num 은 NoGraphMixer 의 hidden dim (결합부 m_tau 차원과 무관, 혼동 주의)
-MARKET_CONFIG = {
-    "NASDAQ": dict(valid_index=756, test_index=1008, market_num=20),
-    "SP500":  dict(valid_index=1006, test_index=1259, market_num=8),
+# arm -> (입력 피처 수, 결합부 combine_mode, m_τ 사용 여부)
+# baseline/add 는 같은 AddHead 를 쓰되 입력 피처만 5 vs 13 (C1).
+# concat/gating 은 13피처 고정, m_τ 주입 구조만 다름 (C3).
+ARM_CONFIG = {
+    "baseline":   dict(feature_set=5,  combine_mode="add",        use_m_tau=False),
+    "add":        dict(feature_set=13, combine_mode="add",        use_m_tau=False),
+    "concat_lin": dict(feature_set=13, combine_mode="concat_lin", use_m_tau=True),
+    "concat_mlp": dict(feature_set=13, combine_mode="concat_mlp", use_m_tau=True),
+    "gating":     dict(feature_set=13, combine_mode="gate",       use_m_tau=True),
 }
 
 
-def set_seed(seed=12345678):
+def set_seed(seed=0):
+    # 시드 스윕(0~4) 짝 비교를 위해 모든 난수원 통일 + 결정론 설정
     random.seed(seed)
-    np.random.seed(123456789)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def load_dataset(data_path, market_name, steps):
-    """원본 train.py 와 동일한 방식으로 데이터를 적재."""
-    if market_name == "SP500":
-        data = np.load(os.path.join(data_path, "SP500", "SP500.npy"))
-        data = data[:, 915:, :]
-        price_data = data[:, :, -1]
-        mask_data = np.ones((data.shape[0], data.shape[1]))
-        eod_data = data
-        gt_data = np.zeros((data.shape[0], data.shape[1]))
-        for t in range(data.shape[0]):
-            for r in range(1, data.shape[1]):
-                gt_data[t][r] = (data[t][r][-1] - data[t][r - steps][-1]) / \
-                                data[t][r - steps][-1]
-    else:
-        base = os.path.join(data_path, market_name)
-        with open(os.path.join(base, "eod_data.pkl"), "rb") as f:
-            eod_data = pickle.load(f)
-        with open(os.path.join(base, "mask_data.pkl"), "rb") as f:
-            mask_data = pickle.load(f)
-        with open(os.path.join(base, "gt_data.pkl"), "rb") as f:
-            gt_data = pickle.load(f)
-        with open(os.path.join(base, "price_data.pkl"), "rb") as f:
-            price_data = pickle.load(f)
-    return eod_data, mask_data, gt_data, price_data
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--combine-mode", default="add",
-                    help="add | gate | film | attn")
-    ap.add_argument("--market", default="NASDAQ", help="NASDAQ | SP500")
-    ap.add_argument("--beta", type=float, default=5.0,
-                    help="gate/film 게이팅 온도 (작을수록 강함)")
-    ap.add_argument("--d-attn", type=int, default=16, help="attn 모드 어텐션 차원")
+    ap.add_argument("--arm", default="baseline",
+                    help="baseline | add | concat_lin | concat_mlp | gating")
+    ap.add_argument("--seed", type=int, default=0, help="재현용 시드 (0~4 스윕 권장)")
+    ap.add_argument("--beta", type=float, default=2.0,
+                    help="gating 게이팅 온도 (작을수록 강함; β 스윕 {1,2,5,10})")
+    ap.add_argument("--hidden", type=int, default=None, help="concat_mlp 은닉 차원 (기본 feat_dim)")
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--lr", type=float, default=0.001)
-    ap.add_argument("--alpha", type=float, default=0.1)
+    ap.add_argument("--alpha", type=float, default=0.1, help="pairwise rank loss 가중")
     ap.add_argument("--lookback", type=int, default=16)
-    ap.add_argument("--market-dim", type=int, default=None,
-                    help="stock mixing 의 hidden m (미지정 시 데이터셋 기본값)")
     ap.add_argument("--scale", type=int, default=3)
-    ap.add_argument("--steps", type=int, default=1)
+    ap.add_argument("--market-num", type=int, default=20,
+                    help="NoGraphMixer hidden(cross-stock mixing 차원). m_τ 와 무관, 전 arm 고정 20")
+    ap.add_argument("--steps", type=int, default=None,
+                    help="forward return 호라이즌(미지정 시 meta.steps 사용)")
     ap.add_argument("--data-path", default="../../dataset",
-                    help="dataset 폴더 (src/exp 기준 기본값)")
-    ap.add_argument("--exp-root", default="../../experiments",
-                    help="결과 저장 루트 (드라이브 경로로 바꿔도 됨)")
+                    help="dataset 폴더 (src/exp 기준 기본값). CSI300/ 하위를 읽는다")
+    ap.add_argument("--exp-root", default="../../experiments")
     ap.add_argument("--tag", default="", help="실험 메모(선택)")
-    ap.add_argument("--list", action="store_true", help="등록된 combine_mode 목록만 출력")
+    ap.add_argument("--list", action="store_true", help="등록된 arm / combine_mode 출력")
     args = ap.parse_args()
 
     if args.list:
+        print("등록된 arm:", ", ".join(ARM_CONFIG))
         print("등록된 combine_mode:", ", ".join(list_modes()))
         return
 
-    set_seed()
+    if args.arm not in ARM_CONFIG:
+        raise ValueError(f"알 수 없는 arm='{args.arm}'. 사용 가능: {list(ARM_CONFIG)}")
+    acfg = ARM_CONFIG[args.arm]
+
+    set_seed(args.seed)
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     # ---- 데이터 ----
-    fea_num = 5
-    eod_data, mask_data, gt_data, price_data = load_dataset(
-        args.data_path, args.market, args.steps)
-    stock_num = eod_data.shape[0]          # 데이터에서 자동 추출 (원본의 하드코딩 footgun 방지)
-    trade_dates = mask_data.shape[1]
-    mc = MARKET_CONFIG.get(args.market, MARKET_CONFIG["NASDAQ"])
-    valid_index, test_index = mc["valid_index"], mc["test_index"]
-    market_dim = args.market_dim if args.market_dim is not None else mc["market_num"]
+    d = load_csi300(args.data_path, feature_set=acfg["feature_set"],
+                    use_m_tau=acfg["use_m_tau"])
+    eod_data, mask_data = d["eod_data"], d["mask_data"]
+    gt_data, price_data, m_tau = d["gt_data"], d["price_data"], d["m_tau"]
+    stock_num = eod_data.shape[0]
+    trade_dates = eod_data.shape[1]
+    fea_num = eod_data.shape[-1]
+    valid_index, test_index = d["valid_index"], d["test_index"]
+    steps = args.steps if args.steps is not None else d["steps"]
     lookback = args.lookback
-    steps = args.steps
-    print(f"data: stocks={stock_num}, days={trade_dates}, F={eod_data.shape[-1]} "
-          f"(market_num={market_dim}, valid={valid_index}, test={test_index})")
+    market_dim = d["m_dim"] or M_DIM   # head 의 m_τ 입력 차원(63)
+
+    print(f"arm={args.arm} | stocks={stock_num} days={trade_dates} F={fea_num} "
+          f"m_τ={'on' if acfg['use_m_tau'] else 'off'} "
+          f"(valid={valid_index}, test={test_index}, steps={steps})")
 
     # ---- 모델 ----
     model = StockMixerExp(
         stocks=stock_num, time_steps=lookback, channels=fea_num,
-        market=market_dim, scale=args.scale,
-        combine_mode=args.combine_mode, beta=args.beta, d_attn=args.d_attn,
+        market=args.market_num, scale=args.scale,
+        combine_mode=acfg["combine_mode"], beta=args.beta,
+        hidden=args.hidden, market_dim=market_dim,
     ).to(device)
     info = model.describe()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # ---- 실험 폴더 ----
-    # exp_id = 레이어(combine_mode)_데이터(market)_타임스탬프 → 몇 번째 실험인지 식별
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_id = f"{args.combine_mode}_{args.market}_{stamp}"
+    exp_id = f"{args.arm}_CSI300_s{args.seed}_{stamp}"
     exp_dir = os.path.join(args.exp_root, exp_id)
     os.makedirs(exp_dir, exist_ok=True)
-
-    # 결과 파일도 폴더와 같은 exp_id 를 접두사로 붙여 자기설명적으로 저장
-    # (파일만 따로 옮겨도 어떤 실험인지 식별 가능)
     out = lambda name: os.path.join(exp_dir, f"{exp_id}_{name}")
 
     config = dict(
-        exp_id=exp_id, combine_mode=args.combine_mode,
-        market=args.market, epochs=args.epochs, lr=args.lr, alpha=args.alpha,
-        beta=args.beta, d_attn=args.d_attn,
-        lookback=lookback, market_dim=market_dim, scale=args.scale,
-        steps=steps, stock_num=stock_num, device=str(device),
+        exp_id=exp_id, arm=args.arm, combine_mode=acfg["combine_mode"],
+        feature_set=acfg["feature_set"], use_m_tau=acfg["use_m_tau"],
+        market="CSI300", seed=args.seed,
+        epochs=args.epochs, lr=args.lr, alpha=args.alpha,
+        beta=args.beta, hidden=args.hidden,
+        lookback=lookback, channels=fea_num, market_num=args.market_num,
+        m_dim=market_dim, scale=args.scale, steps=steps,
+        stock_num=stock_num, device=str(device),
         total_params=info["total_params"], head_params=info["head_params"],
         tag=args.tag, timestamp=stamp,
     )
@@ -164,24 +163,31 @@ def main():
 
     print("=" * 60)
     print(f"  실험 시작: {exp_id}")
-    print(f"  combine_mode={args.combine_mode} | market={args.market} "
-          f"| device={device}")
+    print(f"  arm={args.arm} combine={acfg['combine_mode']} seed={args.seed} device={device}")
     print(f"  파라미터 총 {info['total_params']:,} (head {info['head_params']:,})")
     print("=" * 60)
 
-    # ---- 배치 유틸 (원본 train.py 와 동일) ----
+    # ---- 배치 유틸 (원본 train.py 계승) ----
     batch_offsets = np.arange(start=0, stop=valid_index, dtype=int)
 
     def get_batch(offset):
         sl = lookback
         mb = mask_data[:, offset: offset + sl + steps]
-        mb = np.min(mb, axis=1)
+        mb = np.min(mb, axis=1)                                  # 윈도우+steps 전체 유효한 종목만
+        # m_τ: 결정(예측)일 = 입력 윈도우 마지막 날(offset+sl-1)의 시장레짐 벡터.
+        # 라벨일(offset+sl+steps-1)이 아니라 마지막 관측일을 써 lookahead 누수를 피한다.
+        mt = m_tau[offset + sl - 1] if m_tau is not None else None
         return (
             eod_data[:, offset:offset + sl, :],
             np.expand_dims(mb, axis=1),
-            np.expand_dims(price_data[:, offset + sl - 1], axis=1),
+            np.expand_dims(price_data[:, offset + sl - 1], axis=1),     # base_price
             np.expand_dims(gt_data[:, offset + sl + steps - 1], axis=1),
+            mt,
         )
+
+    def to_dev(db, mb, pb, gb, mt):
+        t = lambda x: torch.Tensor(x).to(device)
+        return t(db), t(mb), t(pb), t(gb), (t(mt) if mt is not None else None)
 
     def validate(start_index, end_index):
         with torch.no_grad():
@@ -192,8 +198,8 @@ def main():
             loss = reg_loss = rank_loss = 0.0
             base = start_index - lookback - steps + 1
             for off in range(base, end_index - lookback - steps + 1):
-                db, mb, pb, gb = map(lambda x: torch.Tensor(x).to(device), get_batch(off))
-                prediction = model(db, mb)   # mask 전달 → masked m_tau
+                db, mb, pb, gb, mt = to_dev(*get_batch(off))
+                prediction = model(db, mt)
                 cl, crl, crk, cur_rr = get_loss(prediction, gb, pb, mb, stock_num, args.alpha)
                 loss += cl.item(); reg_loss += crl.item(); rank_loss += crk.item()
                 idx = off - base
@@ -204,11 +210,12 @@ def main():
             perf = evaluate(pred, gt, msk)
         return loss, perf
 
-    # ---- 히스토리 csv 준비 ----
+    # ---- 히스토리 csv ----
     hist_path = out("history.csv")
-    hist_fields = ["epoch", "train_loss", "val_loss", "test_loss",
-                   "val_IC", "val_RIC", "val_prec10", "val_SR",
-                   "test_IC", "test_RIC", "test_prec10", "test_SR"]
+    metric_keys = ["IC", "ICIR", "RankIC", "RankICIR", "prec_10", "sharpe5"]
+    hist_fields = (["epoch", "train_loss", "val_loss", "test_loss"]
+                   + [f"val_{k}" for k in metric_keys]
+                   + [f"test_{k}" for k in metric_keys])
     hist_file = open(hist_path, "w", newline="")
     hist_writer = csv.DictWriter(hist_file, fieldnames=hist_fields)
     hist_writer.writeheader()
@@ -223,10 +230,9 @@ def main():
         n_batch = valid_index - lookback - steps + 1
         model.train()
         for j in range(n_batch):
-            db, mb, pb, gb = map(lambda x: torch.Tensor(x).to(device),
-                                 get_batch(batch_offsets[j]))
+            db, mb, pb, gb, mt = to_dev(*get_batch(batch_offsets[j]))
             optimizer.zero_grad()
-            prediction = model(db, mb)   # mask 전달 → masked m_tau
+            prediction = model(db, mt)
             cl, _, _, _ = get_loss(prediction, gb, pb, mb, stock_num, args.alpha)
             cl.backward()
             optimizer.step()
@@ -237,43 +243,39 @@ def main():
         val_loss, val_perf = validate(valid_index, test_index)
         test_loss, test_perf = validate(test_index, trade_dates)
 
-        hist_writer.writerow(dict(
-            epoch=epoch + 1, train_loss=tra_loss, val_loss=val_loss, test_loss=test_loss,
-            val_IC=val_perf["IC"], val_RIC=val_perf["RIC"],
-            val_prec10=val_perf["prec_10"], val_SR=val_perf["sharpe5"],
-            test_IC=test_perf["IC"], test_RIC=test_perf["RIC"],
-            test_prec10=test_perf["prec_10"], test_SR=test_perf["sharpe5"],
-        ))
+        row = dict(epoch=epoch + 1, train_loss=tra_loss, val_loss=val_loss, test_loss=test_loss)
+        for k in metric_keys:
+            row[f"val_{k}"] = val_perf[k]
+            row[f"test_{k}"] = test_perf[k]
+        hist_writer.writerow(row)
         hist_file.flush()
 
         if val_loss < best_valid_loss:
             best_valid_loss = val_loss
             best = dict(epoch=epoch + 1, val_loss=val_loss,
                         val_perf=val_perf, test_perf=test_perf)
-            # best 가중치 저장
-            torch.save({
-                "model_state": model.state_dict(),
-                "config": config,
-                "epoch": epoch + 1,
-            }, out("best_model.pt"))
+            torch.save({"model_state": model.state_dict(), "config": config,
+                        "epoch": epoch + 1}, out("best_model.pt"))
 
-        print(f"[{epoch+1:3d}/{args.epochs}] "
-              f"train={tra_loss:.2e} val={val_loss:.2e} test={test_loss:.2e} | "
-              f"test IC={test_perf['IC']:.4f} RIC={test_perf['RIC']:.4f} "
-              f"prec@10={test_perf['prec_10']:.4f} SR={test_perf['sharpe5']:.4f}")
+        print(f"[{epoch+1:3d}/{args.epochs}] train={tra_loss:.2e} val={val_loss:.2e} "
+              f"test={test_loss:.2e} | test IC={test_perf['IC']:.4f} "
+              f"RankIC={test_perf['RankIC']:.4f} prec@10={test_perf['prec_10']:.4f} "
+              f"SR={test_perf['sharpe5']:.4f}")
 
     hist_file.close()
     elapsed = time.time() - t_start
 
-    # ---- best 결과 저장 + 비교표 누적 ----
-    bt = best["test_perf"]; bv = best["val_perf"]
+    # ---- best 요약 + 비교표 재구성 ----
+    bt, bv = best["test_perf"], best["val_perf"]
     summary = dict(
-        exp_id=exp_id, combine_mode=args.combine_mode,
-        market=args.market, beta=args.beta, d_attn=args.d_attn,
+        exp_id=exp_id, arm=args.arm, combine_mode=acfg["combine_mode"],
+        feature_set=acfg["feature_set"], use_m_tau=acfg["use_m_tau"],
+        seed=args.seed, beta=args.beta, hidden=args.hidden,
         epochs=args.epochs, best_epoch=best["epoch"],
         best_val_loss=round(best["val_loss"], 6),
-        val_IC=round(bv["IC"], 4), val_RIC=round(bv["RIC"], 4),
-        test_IC=round(bt["IC"], 4), test_RIC=round(bt["RIC"], 4),
+        val_IC=round(bv["IC"], 4), val_RankIC=round(bv["RankIC"], 4),
+        test_IC=round(bt["IC"], 4), test_ICIR=round(bt["ICIR"], 4),
+        test_RankIC=round(bt["RankIC"], 4), test_RankICIR=round(bt["RankICIR"], 4),
         test_prec10=round(bt["prec_10"], 4), test_SR=round(bt["sharpe5"], 4),
         total_params=info["total_params"], head_params=info["head_params"],
         minutes=round(elapsed / 60, 1), tag=args.tag, timestamp=stamp,
@@ -281,11 +283,7 @@ def main():
     with open(out("best_summary.json"), "w") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    # comparison.csv 재구성 (append 아님)
-    # 모든 실험 폴더의 best_summary.json 을 모아 exp_id 기준으로 정렬해 매번 다시 쓴다.
-    #   - 행마다 exp_id(레이어_데이터_타임스탬프)가 있어 어떤 실험인지 식별 가능
-    #   - 옛 행이 남지 않고 항상 최신 결과 집합만 반영 (바뀐 결과 확인 용이)
-    #   - 스키마가 달라져도(컬럼 추가) 키 합집합으로 흡수 → ParserError 방지
+    # comparison.csv : 모든 best_summary.json 을 모아 exp_id 정렬로 매번 재작성(append 아님)
     os.makedirs(args.exp_root, exist_ok=True)
     cmp_path = os.path.join(args.exp_root, "comparison.csv")
     all_rows = []
@@ -296,8 +294,8 @@ def main():
         except (OSError, json.JSONDecodeError):
             pass
     all_rows.sort(key=lambda r: r.get("exp_id", ""))
-    fieldnames = list(summary.keys())                 # 이번 실험 키를 기준 컬럼 순서로
-    for r in all_rows:                                 # 다른 스키마의 추가 키는 뒤에 덧붙임
+    fieldnames = list(summary.keys())
+    for r in all_rows:
         for k in r:
             if k not in fieldnames:
                 fieldnames.append(k)
@@ -308,10 +306,9 @@ def main():
 
     print("=" * 60)
     print(f"  완료: best epoch {best['epoch']} (val_loss={best['val_loss']:.2e})")
-    print(f"  test IC={bt['IC']:.4f} RIC={bt['RIC']:.4f} "
+    print(f"  test IC={bt['IC']:.4f} ICIR={bt['ICIR']:.4f} RankIC={bt['RankIC']:.4f} "
           f"prec@10={bt['prec_10']:.4f} SR={bt['sharpe5']:.4f}")
-    print(f"  소요 {summary['minutes']} 분")
-    print(f"  저장 위치: {exp_dir}")
+    print(f"  소요 {summary['minutes']} 분 | 저장 {exp_dir}")
     print(f"  비교표 재구성: {cmp_path} (총 {len(all_rows)}개 실험)")
     print("=" * 60)
 
