@@ -149,6 +149,41 @@ def build_gt(price_norm, steps):
     return gt
 
 
+def finalize_arrays(close, alpha, eod5, eod13, price_norm, gt_data, in_univ, steps):
+    """단일 유효성 마스크 산출 + price placeholder 처리(분모 0 방지).
+
+    price_data 는 get_loss 의 분모(base_price)다. 0 이면 (pred-0)/0 = inf, 이후
+    inf * mask(=0) = NaN 으로 손실이 첫 스텝부터 NaN 이 된다(원본은 결측을 1.1 로 채워 회피).
+    따라서:
+      (1) 유효성에 price>0 을 포함 → 유효인데 price<=0 인 셀은 드롭하고 개수를 보고(검증),
+      (2) 마스크 밖 price 는 0 대신 placeholder 1.0 으로 채워 base_price 가 절대 0 이 안 되게 한다.
+
+    반환: (eod5, eod13, price_data, gt_data, mask_data, n_drop_nonpos_price)
+    """
+    N, T = close.shape
+    has_close = np.isfinite(close)
+    has_alpha = np.isfinite(alpha).all(axis=-1)
+    has_label = np.zeros((N, T), dtype=bool)
+    has_label[:, steps:] = np.isfinite(close[:, steps:]) & np.isfinite(close[:, :-steps])
+    has_pos_price = np.isfinite(price_norm) & (price_norm > 0)
+
+    base_valid = has_close & has_alpha & has_label & in_univ
+    n_drop = int((base_valid & ~has_pos_price).sum())     # 검증: 유효였으나 price<=0 인 셀 수
+    mask_data = (base_valid & has_pos_price).astype(np.float32)
+
+    eod5 = eod5.copy(); eod13 = eod13.copy()
+    eod5[~np.isfinite(eod5)] = 0.0                        # 입력 결측 → 0 (마스크로 가려짐)
+    eod13[~np.isfinite(eod13)] = 0.0
+    invalid = mask_data < 0.5
+    price_data = np.where(has_pos_price, price_norm, 1.0).astype(np.float32)
+    price_data[invalid] = 1.0                            # 마스크 밖 base_price = placeholder 1.0
+    eod5[..., 4] = price_data                            # eod5 마지막 채널 == price 동일성 유지
+    gt_data = gt_data.astype(np.float32).copy()
+    gt_data[~np.isfinite(gt_data)] = 0.0                 # NaN/inf 라벨 제거
+    gt_data[invalid] = 0.0
+    return eod5, eod13, price_data, gt_data, mask_data, n_drop
+
+
 def load_m_tau(market_csv, date_order):
     """MASTER csi_market_information.csv (헤더 3줄: feature/expr/datetime) → (T,63)."""
     df = pd.read_csv(os.path.expanduser(market_csv), skiprows=3, header=None, index_col=0)
@@ -202,19 +237,12 @@ def main():
     # Step 5 — m_τ
     m_tau = load_m_tau(args.market_csv, date_order)                 # (T,63)
 
-    # 단일 유효성 마스크(§6.5): close ∧ 13피처(raw) ∧ 라벨 ∧ 당일 유니버스, 전 arm 동일
-    has_close = np.isfinite(close)
-    has_alpha = np.isfinite(alpha).all(axis=-1)
-    has_label = np.zeros((N, T), dtype=bool)
-    has_label[:, args.steps:] = np.isfinite(close[:, args.steps:]) & np.isfinite(close[:, :-args.steps])
+    # 단일 유효성 마스크(§6.5) + price placeholder(분모 0 방지): finalize_arrays 참조
     in_univ = membership_mask(stock_order, date_order, spells) > 0.5
-    mask_data = (has_close & has_alpha & has_label & in_univ).astype(np.float32)
-
-    # 마스크 밖/NaN 셀은 0 으로 (격자 깨끗이)
-    for arr in (eod5, eod13):
-        arr[~np.isfinite(arr)] = 0.0
-    price_data = np.nan_to_num(price_data).astype(np.float32)
-    gt_data = np.nan_to_num(gt_data).astype(np.float32)
+    eod5, eod13, price_data, gt_data, mask_data, n_drop = finalize_arrays(
+        close, alpha, eod5, eod13, price_data, gt_data, in_univ, args.steps)
+    print(f"검증: 유효였으나 price<=0 로 드롭된 셀 = {n_drop} "
+          f"(placeholder 1.0 적용 → base_price 0 제거)")
 
     # ---- 저장 ----
     def dump(name, obj):
@@ -232,13 +260,15 @@ def main():
 
     # ---- 빌드 후 assert (data build.md §8/§9) ----
     assert np.allclose(eod5[..., 4], price_data, atol=1e-5), "eod5[...,4] != price_data"
+    assert (price_data > 0).all(), "price_data 에 0/음수 존재 → base_price 분모 0 위험"
+    assert np.isfinite(gt_data).all(), "gt_data 에 NaN/inf 존재"
     assert not np.isnan(mask_data).any(), "mask 에 NaN"
     assert m_tau.shape == (T, 63), f"m_τ shape {m_tau.shape}"
     print("=" * 60)
     print(f"  저장 완료: {out_dir}")
     print(f"  eod5{eod5.shape} eod13{eod13.shape} m_tau{m_tau.shape} "
           f"mask 유효율={mask_data.mean():.3f}")
-    print(f"  assert 통과: eod5[...,4]==price, mask no-NaN, m_τ=(T,63)")
+    print(f"  assert 통과: eod5[...,4]==price, price>0(분모안전), gt finite, mask no-NaN, m_τ=(T,63)")
     print(f"  다음 단계: 이 폴더({out_dir})를 드라이브에 업로드 → 코랩 셀 3.5(A)에서 복사")
     print("=" * 60)
 

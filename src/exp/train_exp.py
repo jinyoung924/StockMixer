@@ -203,9 +203,9 @@ def main():
                 cl, crl, crk, cur_rr = get_loss(prediction, gb, pb, mb, stock_num, args.alpha)
                 loss += cl.item(); reg_loss += crl.item(); rank_loss += crk.item()
                 idx = off - base
-                pred[:, idx] = cur_rr[:, 0].cpu()
-                gt[:, idx] = gb[:, 0].cpu()
-                msk[:, idx] = mb[:, 0].cpu()
+                pred[:, idx] = cur_rr[:, 0].cpu().numpy()
+                gt[:, idx] = gb[:, 0].cpu().numpy()
+                msk[:, idx] = mb[:, 0].cpu().numpy()
             loss /= n
             perf = evaluate(pred, gt, msk)
         return loss, perf
