@@ -101,6 +101,10 @@ def main():
                     help="gating 게이팅 온도 (작을수록 강함; β 스윕 {1,2,5,10})")
     ap.add_argument("--hidden", type=int, default=None, help="concat_mlp 은닉 차원 (기본 feat_dim)")
     ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--eval-every", type=int, default=5,
+                    help="val/test 평가 주기(에폭). 1=매 에폭(원래 동작). 클수록 빠름")
+    ap.add_argument("--eval-warmup", type=int, default=0,
+                    help="이 에폭 전에는 평가 생략(초반 무의미 구간 스킵)")
     ap.add_argument("--lr", type=float, default=0.001)
     ap.add_argument("--alpha", type=float, default=0.1, help="pairwise rank loss 가중")
     ap.add_argument("--lookback", type=int, default=16)
@@ -170,7 +174,8 @@ def main():
         exp_id=exp_id, arm=args.arm, combine_mode=acfg["combine_mode"],
         feature_set=acfg["feature"], use_m_tau=acfg["use_m_tau"],
         market="CSI300", seed=args.seed,
-        epochs=args.epochs, lr=args.lr, alpha=args.alpha,
+        epochs=args.epochs, eval_every=args.eval_every, eval_warmup=args.eval_warmup,
+        lr=args.lr, alpha=args.alpha,
         beta=args.beta, hidden=args.hidden,
         lookback=lookback, channels=fea_num, market_num=args.market_num,
         m_dim=market_dim, scale=args.scale, steps=steps,
@@ -187,27 +192,29 @@ def main():
     print(f"  파라미터 총 {info['total_params']:,} (head {info['head_params']:,})")
     print("=" * 60)
 
-    # ---- 배치 유틸 (원본 train.py 계승) ----
+    # ---- 전체 배열을 device 로 1회만 올림(매 스텝 H2D 전송 제거; 통상 2~5배 가속) ----
+    eod_t = torch.as_tensor(eod_data, dtype=torch.float32, device=device)
+    mask_t = torch.as_tensor(mask_data, dtype=torch.float32, device=device)
+    gt_t = torch.as_tensor(gt_data, dtype=torch.float32, device=device)
+    price_t = torch.as_tensor(price_data, dtype=torch.float32, device=device)
+    mtau_t = (torch.as_tensor(m_tau, dtype=torch.float32, device=device)
+              if m_tau is not None else None)
     batch_offsets = np.arange(start=0, stop=valid_index, dtype=int)
 
     def get_batch(offset):
+        # device 상주 텐서를 슬라이싱만 한다(복사·전송 없음).
         sl = lookback
-        mb = mask_data[:, offset: offset + sl + steps]
-        mb = np.min(mb, axis=1)                                  # 윈도우+steps 전체 유효한 종목만
+        mb = mask_t[:, offset: offset + sl + steps].min(dim=1).values.unsqueeze(1)
         # m_τ: 결정(예측)일 = 입력 윈도우 마지막 날(offset+sl-1)의 시장레짐 벡터.
         # 라벨일(offset+sl+steps-1)이 아니라 마지막 관측일을 써 lookahead 누수를 피한다.
-        mt = m_tau[offset + sl - 1] if m_tau is not None else None
+        mt = mtau_t[offset + sl - 1] if mtau_t is not None else None
         return (
-            eod_data[:, offset:offset + sl, :],
-            np.expand_dims(mb, axis=1),
-            np.expand_dims(price_data[:, offset + sl - 1], axis=1),     # base_price
-            np.expand_dims(gt_data[:, offset + sl + steps - 1], axis=1),
+            eod_t[:, offset:offset + sl, :],
+            mb,                                                    # (N,1)
+            price_t[:, offset + sl - 1].unsqueeze(1),              # base_price (N,1)
+            gt_t[:, offset + sl + steps - 1].unsqueeze(1),         # (N,1)
             mt,
         )
-
-    def to_dev(db, mb, pb, gb, mt):
-        t = lambda x: torch.Tensor(x).to(device)
-        return t(db), t(mb), t(pb), t(gb), (t(mt) if mt is not None else None)
 
     def validate(start_index, end_index):
         with torch.no_grad():
@@ -215,13 +222,12 @@ def main():
             pred = np.zeros([stock_num, n], dtype=float)
             gt = np.zeros([stock_num, n], dtype=float)
             msk = np.zeros([stock_num, n], dtype=float)
-            loss = reg_loss = rank_loss = 0.0
+            loss = 0.0
             base = start_index - lookback - steps + 1
             for off in range(base, end_index - lookback - steps + 1):
-                db, mb, pb, gb, mt = to_dev(*get_batch(off))
-                prediction = model(db, mt)
-                cl, crl, crk, cur_rr = get_loss(prediction, gb, pb, mb, stock_num, args.alpha)
-                loss += cl.item(); reg_loss += crl.item(); rank_loss += crk.item()
+                db, mb, pb, gb, mt = get_batch(off)
+                cl, _, _, cur_rr = get_loss(model(db, mt), gb, pb, mb, stock_num, args.alpha)
+                loss += cl.item()
                 idx = off - base
                 pred[:, idx] = cur_rr[:, 0].cpu().numpy()
                 gt[:, idx] = gb[:, 0].cpu().numpy()
@@ -250,14 +256,22 @@ def main():
         n_batch = valid_index - lookback - steps + 1
         model.train()
         for j in range(n_batch):
-            db, mb, pb, gb, mt = to_dev(*get_batch(batch_offsets[j]))
+            db, mb, pb, gb, mt = get_batch(batch_offsets[j])
             optimizer.zero_grad()
-            prediction = model(db, mt)
-            cl, _, _, _ = get_loss(prediction, gb, pb, mb, stock_num, args.alpha)
+            cl, _, _, _ = get_loss(model(db, mt), gb, pb, mb, stock_num, args.alpha)
             cl.backward()
             optimizer.step()
             tra_loss += cl.item()
         tra_loss /= n_batch
+
+        # 평가 cadence: 워밍업 이후 eval_every 에폭마다 + 마지막 에폭은 항상(best 누락 방지).
+        do_eval = ((epoch + 1) >= args.eval_warmup and (epoch + 1) % args.eval_every == 0) \
+            or (epoch + 1 == args.epochs)
+        if not do_eval:
+            print(f"[{epoch+1:3d}/{args.epochs}] train={tra_loss:.2e} (eval skip)")
+            hist_writer.writerow(dict(epoch=epoch + 1, train_loss=tra_loss))
+            hist_file.flush()
+            continue
 
         model.eval()
         val_loss, val_perf = validate(valid_index, test_index)

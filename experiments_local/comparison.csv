@@ -1,0 +1,2 @@
+exp_id,arm,combine_mode,feature_set,use_m_tau,seed,steps,beta,hidden,epochs,best_epoch,best_val_loss,val_IC,val_RankIC,test_IC,test_ICIR,test_RankIC,test_RankICIR,test_prec10,test_SR,total_params,head_params,minutes,tag,timestamp
+baseline_CSI300_s0_st5_20260621_121841,baseline,add,close5,False,0,5,2.0,,1,1,0.003209,-0.0051,-0.0009,-0.0319,-0.1957,-0.0065,-0.039,0.5006,2.3617,30629,82,0.7,,20260621_121841
