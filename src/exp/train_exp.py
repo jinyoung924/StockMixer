@@ -2,14 +2,14 @@
 시장레짐 정보 × 주입 구조 비교 실험 — CSI300 / StockMixer 하네스.
 
 검증 목표(두 축을 분리):
-  Q1 정보의 가치  : 더 풍부한 정보(alpha158 13피처 + m_τ)가 예측력을 올리는가?
+  Q1 정보의 가치  : 더 풍부한 정보(OHLCV 5피처 + m_τ)가 예측력을 올리는가?
   Q2 구조의 역할  : 같은 정보라도 주입 구조(add/concat/gating)가 결과를 바꾸는가?
 
 4개 arm (입력 피처 × 결합부만 다르고 mask/gt/price·백본·분할은 전부 고정):
-  baseline   : 종가 5피처     + AddHead        (CSI300 위의 원본 StockMixer, 절대 출발점)
-  add        : alpha158 13피처 + AddHead        (구조 비교 기준, m_τ 미반영)
-  concat     : alpha158 13피처 + Concat(m_τ)    (덧셈적 주입; _lin / _mlp 변형)
-  gating     : alpha158 13피처 + Gate(m_τ)      (곱셈적 주입, 주 모델)
+  baseline   : 종가-MA 5피처 + AddHead        (CSI300 위의 원본 StockMixer, 절대 출발점)
+  add        : OHLCV 5피처   + AddHead        (구조 비교 기준, m_τ 미반영)
+  concat     : OHLCV 5피처   + Concat(m_τ)    (덧셈적 주입; _lin / _mlp 변형)
+  gating     : OHLCV 5피처   + Gate(m_τ)      (곱셈적 주입, 주 모델)
 
 비교 축:
   C1(피처)  baseline ↔ add          : 결합부 동일, 입력 5→13
@@ -18,7 +18,10 @@
   D1(진단)  add ↔ concat_lin        : 선형 주입은 순위 불변 예상
 
 원본 train.py 의 학습/예측/평가 골격을 계승하되:
-  - 라벨은 StockMixer raw forward return, 손실은 원본 get_loss(base_price=price_data).
+  - 라벨은 StockMixer raw forward return.
+  - 손실은 StockMixer 원본 get_loss = (pred-base_price)/base_price 의 MSE + α·rank.
+    base_price = price_data = close/cnorm. OHLCV·종가-MA 모두 close 채널을 입력에 포함하므로
+    base_price 를 모델이 복원할 수 있어 유효(전 arm 동일 손실 → C1 공정성).
   - 평가는 evaluator_exp(IC/ICIR/RankIC/RankICIR/prec@10/SR).
   - 결과는 arm×seed 로 experiments/ 에 쌓고 comparison.csv 로 재구성.
 
@@ -46,22 +49,35 @@ _SRC_DIR = os.path.dirname(_THIS_DIR)
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from model import get_loss                 # 원본 손실(MSE + α·pairwise rank), 그대로 계승
+from model import get_loss                 # 원본 손실(MSE + α·rank), base_price 나눗셈
 from model_exp import StockMixerExp
 from evaluator_exp import evaluate
 from data_csi300 import load_csi300
 from final_layers import list_modes, M_DIM
 
 
-# arm -> (입력 피처 수, 결합부 combine_mode, m_τ 사용 여부)
-# baseline/add 는 같은 AddHead 를 쓰되 입력 피처만 5 vs 13 (C1).
-# concat/gating 은 13피처 고정, m_τ 주입 구조만 다름 (C3).
+def forward_return(price, steps):
+    """price_data(=close/cnorm)에서 steps-day forward return 라벨 재계산.
+
+    gt[t] = (price[t]-price[t-steps])/price[t-steps]. cnorm 상쇄로 raw 수익률과 동일.
+    무효/비유한 셀은 0(어차피 mask 로 가려짐).
+    """
+    gt = np.zeros_like(price, dtype=np.float32)
+    gt[:, steps:] = (price[:, steps:] - price[:, :-steps]) / (price[:, :-steps] + 1e-12)
+    gt[~np.isfinite(gt)] = 0.0
+    return gt
+
+
+# arm -> (입력 피처 셋, 결합부 combine_mode, m_τ 사용 여부)
+# baseline/add 는 같은 AddHead 를 쓰되 입력 피처만 close5 vs ohlcv (C1).
+# concat/gating 은 ohlcv 고정, m_τ 주입 구조만 다름 (C3).
+# OHLCV 는 close 채널을 포함하므로 원본 get_loss(base_price=price_data)가 전 arm 유효.
 ARM_CONFIG = {
-    "baseline":   dict(feature_set=5,  combine_mode="add",        use_m_tau=False),
-    "add":        dict(feature_set=13, combine_mode="add",        use_m_tau=False),
-    "concat_lin": dict(feature_set=13, combine_mode="concat_lin", use_m_tau=True),
-    "concat_mlp": dict(feature_set=13, combine_mode="concat_mlp", use_m_tau=True),
-    "gating":     dict(feature_set=13, combine_mode="gate",       use_m_tau=True),
+    "baseline":   dict(feature="close5", combine_mode="add",        use_m_tau=False),
+    "add":        dict(feature="ohlcv",  combine_mode="add",        use_m_tau=False),
+    "concat_lin": dict(feature="ohlcv",  combine_mode="concat_lin", use_m_tau=True),
+    "concat_mlp": dict(feature="ohlcv",  combine_mode="concat_mlp", use_m_tau=True),
+    "gating":     dict(feature="ohlcv",  combine_mode="gate",       use_m_tau=True),
 }
 
 
@@ -113,10 +129,10 @@ def main():
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     # ---- 데이터 ----
-    d = load_csi300(args.data_path, feature_set=acfg["feature_set"],
+    d = load_csi300(args.data_path, feature=acfg["feature"],
                     use_m_tau=acfg["use_m_tau"])
     eod_data, mask_data = d["eod_data"], d["mask_data"]
-    gt_data, price_data, m_tau = d["gt_data"], d["price_data"], d["m_tau"]
+    price_data, m_tau = d["price_data"], d["m_tau"]
     stock_num = eod_data.shape[0]
     trade_dates = eod_data.shape[1]
     fea_num = eod_data.shape[-1]
@@ -124,6 +140,10 @@ def main():
     steps = args.steps if args.steps is not None else d["steps"]
     lookback = args.lookback
     market_dim = d["m_dim"] or M_DIM   # head 의 m_τ 입력 차원(63)
+
+    # gt 를 학습 시점 steps 로 price_data 에서 재계산(빌드 steps 와 무관하게 호라이즌 확정).
+    # price=close/cnorm 이라 cnorm 이 상쇄 → raw forward return 과 동일. 무효 셀은 mask 로 가려짐.
+    gt_data = forward_return(price_data, steps)
 
     print(f"arm={args.arm} | stocks={stock_num} days={trade_dates} F={fea_num} "
           f"m_τ={'on' if acfg['use_m_tau'] else 'off'} "
@@ -141,14 +161,14 @@ def main():
 
     # ---- 실험 폴더 ----
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_id = f"{args.arm}_CSI300_s{args.seed}_{stamp}"
+    exp_id = f"{args.arm}_CSI300_s{args.seed}_st{steps}_{stamp}"
     exp_dir = os.path.join(args.exp_root, exp_id)
     os.makedirs(exp_dir, exist_ok=True)
     out = lambda name: os.path.join(exp_dir, f"{exp_id}_{name}")
 
     config = dict(
         exp_id=exp_id, arm=args.arm, combine_mode=acfg["combine_mode"],
-        feature_set=acfg["feature_set"], use_m_tau=acfg["use_m_tau"],
+        feature_set=acfg["feature"], use_m_tau=acfg["use_m_tau"],
         market="CSI300", seed=args.seed,
         epochs=args.epochs, lr=args.lr, alpha=args.alpha,
         beta=args.beta, hidden=args.hidden,
@@ -269,8 +289,8 @@ def main():
     bt, bv = best["test_perf"], best["val_perf"]
     summary = dict(
         exp_id=exp_id, arm=args.arm, combine_mode=acfg["combine_mode"],
-        feature_set=acfg["feature_set"], use_m_tau=acfg["use_m_tau"],
-        seed=args.seed, beta=args.beta, hidden=args.hidden,
+        feature_set=acfg["feature"], use_m_tau=acfg["use_m_tau"],
+        seed=args.seed, steps=steps, beta=args.beta, hidden=args.hidden,
         epochs=args.epochs, best_epoch=best["epoch"],
         best_val_loss=round(best["val_loss"], 6),
         val_IC=round(bv["IC"], 4), val_RankIC=round(bv["RankIC"], 4),

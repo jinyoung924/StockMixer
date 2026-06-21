@@ -37,7 +37,7 @@ def as_market_vec(m_tau):
 
 
 # ----------------------------------------------------------------------
-# add : 고정 가중치 단순 합산 (원본 baseline). baseline arm(5피처)·add arm(13피처) 공용.
+# add : 고정 가중치 단순 합산 (원본 baseline). baseline arm(종가-MA 5)·add arm(OHLCV 5) 공용.
 # ----------------------------------------------------------------------
 class AddHead(nn.Module):
     def __init__(self, feat_dim, market_dim=None):
